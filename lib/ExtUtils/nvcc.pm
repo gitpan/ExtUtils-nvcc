@@ -1,150 +1,502 @@
-# Screw all this. Just issue the script, and use environment variables to make
-# the script output debugging and/or dry run info instead of going through the
-# works. Librarify it, eventually, just not now.
-
 =head1 NAME
 
-ExtUtils::nvcc - the library that will eventually be behind C<perl_nvcc>
-
-=head1 DESCRIPTION
-
-This is a work in progress, and for now C<perl_nvcc> operates without this
-library. Check out it's documentation: L<perl_nvcc>.
-
-=begin later
-
-=head1 SYNOPSIS
-
- use ExtUtils::nvcc;
- 
- # Create a new wrapper with the default options:
- my $wrapper = ExtUtils::nvcc->new(@args);
- 
- # Create a new wrapper, to be tweaked before giving it arguments:
- my $wrapper = ExtUtils::nvcc->new({verbose => 1, });
- $wrapper->set_args(@args);
- $wrapper->add_args(@args);
- 
- # Create a new tweaked wrapper 
- 
- print "I'm compiling (as opposed to linking)\n" if ($wrapper->is_compiling);
- print "The unrecognized options include\n  "
-	, join("\n  ", $wrapper->unrecognized), "\n";
- $wrapper->rename_c_source;
- $wrapper->execute;
-
-=head1 DESCRIPTION
-
-This module provides a class aimed at taking an arbitrary set of command-line
-options for a generic compiler and rewriting them in a way that nVidia's nvcc
-can understand.
-
-=end later
+ExtUtils::nvcc - CUDA compiler and linker wrapper for Perl's toolchain
 
 =cut
-
 
 use strict;
 use warnings;
 
 # These are necessary for Module::Build to work simply:
 package ExtUtils::nvcc;
-
 use vars qw($VERSION);
-$VERSION = '0.01';
 
-=begin later
+=head1 VERSION
 
-=head2 ExtUtils::nvcc->new
-
-The class constructor. This takes a list of arguments that you would expect to
-send to gcc/g++.
+This documentation explains the use of ExtUtils::nvcc version 0.02.
 
 =cut
 
-sub new {
-	my $class = shift;
+$VERSION = '0.02';
+
+# For errors, of course:
+use Carp qw(croak);
+
+=head1 SYNOPSES
+
+I have included a fully working example for L<Inline::C>, as well as other
+partial examples for L<ExtUtils::MakeMaker> and L<Module::Build>.
+
+=head2 Inline::C
+
+ #!/usr/bin/perl
+ use strict;
+ use warnings;
+ 
+ use ExtUtils::nvcc;
+ # Here's the magic sauce
+ use Inline C => DATA => ExtUtils::nvcc::Inline;
+ 
+ # The rest of this is just a working example
+ 
+ # Generate a series of 100 sequential values and pack them
+ # as an array of floats:
+ my $data = pack('f*', 1..100); 
+ 
+ # Call the Perl-callable wrapper to the CUDA kernel:
+ cuda_test($data);
+ 
+ # Print the results
+ print "Got ", join (', ', unpack('f*', $data)), "\n";
+ 
+ END {
+     # I am having trouble with memory leaks. This messgae
+     # indicates that the segmentation fault occurrs after
+     # the end of the script's execution.
+     print "Really done!\n";
+ }
+ 
+ __END__
+ 
+ __C__
+ 
+ // This is a very simple CUDA kernel that triples the value of the
+ // global data associated with the location at threadIdx.x. NOTE: this
+ // is a particularly good example of BAD programming - it should be
+ // more defensive. It is just a proof of concept, to show that you can
+ // indeed write CUDA kernels using Inline::C.
+ 
+ __global__ void triple(float * data_g) {
+     data_g[threadIdx.x] *= 3;
+ }
+ 
+ // NOTE: Do not make such a kernel a regular habit. Generally, copying
+ // data to and from the device is very, very slow (compared with all
+ // other CUDA operations). This is just a proof of concept.
+ 
+ void cuda_test(char * input) {
+     // Inline::C knows how to massage a Perl scalar into a char
+     // array (pointer), which I can easily cast as a float pointer:
+     float * data = (float * ) input;
+     
+     // Allocate the memory of the device:
+     float * data_d;
+     unsigned int data_bytes = sizeof(float) * 100;
+     cudaMalloc(&data_d, data_bytes);
+  
+     // Copy the host memory to the device:
+     cudaMemcpy(data_d, data, data_bytes, cudaMemcpyHostToDevice);
+     
+     // Print a status indicator and execuate the kernel
+     printf("Trippling values via CUDA\n");
+ 
+     // Execute the kernel:
+     triple <<<1, 100>>>(data_d);
+     
+     // Copy the contents back to the Perl scalar:
+     cudaMemcpy(data, data_d, data_bytes, cudaMemcpyDeviceToHost);
+     
+     // Free the device memory
+     cudaFree(data_d);
+ }
+
+=head2 ExtUtils::MakeMaker
+
+ # In your Makefile.PL:
+ use ExtUtils::MakeMaker;
+ use ExtUtils::nvcc;
+ 
+ WriteMakefile(
+     # ... other options ...
+     ExtUtils::nvcc::EUMM,
+ );
+
+=head2 Module::Build
+
+ # In your Build.PL file:
+ use Module::Build;
+ use ExtUtils::nvcc;
+ 
+ my $build = Module::Build->new(
+     # ... other options ...
+     config => {ExtUtils::nvcc::MB},
+ );
+
+
+=head1 DESCRIPTION
+
+This module serves as the configuration front-end to a Perl module that knows
+how to translate arbitrary command-line arguments into nvcc-digestable
+command-line arguments. This means you can use nvcc to compile CUDA code for
+Perl. I discuss that functionality in L<ExtUtils::nvcc::Backend>.
+
+This module functions for your day-to-day use of ExtUtils::nvcc (if there is
+such a thing as day-to-day use of a toolchain). It provides a few functions that
+generate the configuration keys necessary to get L<Inline::C>,
+L<ExtUtils::MakeMaker>, and L<Module::Build> to use L<ExtUtils::nvcc::Backend>
+to compile your CUDA code. The functions you would use are, respectively,
+C<ExtUtils::nvcc::Inline>, C<ExtUtils::nvcc::EUMM>, and C<ExtUtils::nvcc::MB>.
+
+=head2 Inline
+
+If you want to use CUDA in your C<Inline::C> scripts, you simply need to add
+the proper configuration options. Those options are generated for you (in an
+alternating key => value list) by the function C<ExtUtils::nvcc::Inline>:
+
+ use ExtUtils::nvcc;
+ use Inline C => DATA => ExtUtils::nvcc::Inline;
+
+This is equivalent to the following:
+
+ use Inline C => DATA =>
+   CC => "$^X -MExtUtils::nvcc::Backend -eExtUtils::nvcc::Backend::compiler --",
+   LD => "$^X -MExtUtils::nvcc::Backend -eExtUtils::nvcc::Backend::linker --";
+
+And now you understand why you would use the function that generates these
+options for you. If you find that you are having trouble, you can get more
+verbose output by calling C<Inline> with the C<verbose> key, as discussed under
+L</Optional Arguments>:
+
+ use Inline C => DATA => ExtUtils::nvcc::Inline('verbose');
+
+=cut
+
+################################################################################
+# Usage			: Inline([args])
+# Purpose		: Returns the key => value pairs appropriate for Inline to use
+#				: ExtUtils::nvcc::Backend as a compiler and linker wrapper.
+# Returns		: Compiler and linker key => value pairs
+# Parameters	: arguments (simple options) that control how
+#				: ExtUtils::nvcc::Backend runs
+# Throws		: nothing
+# Comments		: none
+# See also		: EUMM, MB, build_args
+
+sub Inline {
+	return	CC => build_args('compiler', @_),
+			LD => build_args('linker', @_);
+}
+
+=head2 EUMM
+
+If you want to use CUDA in your XS files and you use L<ExtUtils::MakeMaker> to handle your
+distribution, ExtUtils::nvcc provides a function to specify your compiler and linker so
+that they use ExtUtils::nvcc to properly handle the compiler and linker arguments for you.
+The function is called C<ExtUtils::nvcc::EUMM>. You would place it directly into your
+options for C<WriteMakefile> like so:
+
+ use ExtUtils::nvcc;
+ WriteMakefile(
+     # ... other options ...
+     ExtUtils::nvcc::EUMM,
+ );
+
+This is equivalent to the following:
+
+ WriteMakefile(
+     # ... other options ...
+     CC => "$^X -MExtUtils::nvcc -eExtUtils::nvcc::compiler --",
+     LD => "$^X -MExtUtils::nvcc -eExtUtils::nvcc::linker --",
+ );
+
+If you want more verbose output, you can call C<ExtUtils::nvcc::EUMM> with the
+C<verbose> argument, as discussed under L</Optional Arguments>:
+
+ use ExtUtils::nvcc;
+ WriteMakefile(
+     # ... other options ...
+     ExtUtils::nvcc::EUMM('verbose'),
+ );
+
+=cut
+
+################################################################################
+# Usage			: EUMM([args])
+# Purpose		: Returns the key => value pairs appropriate for
+#				: ExtUtils::MakeMaker to use ExtUtils::nvcc::Backend as a
+#				: compiler and linker wrapper.
+# Returns		: Compiler and linker key => value pairs
+# Parameters	: arguments (simple options) that control how
+#				: ExtUtils::nvcc::Backend runs
+# Throws		: nothing
+# Comments		: none
+# See also		: Inline, MB, build_args
+
+sub EUMM {
+	return	CC => build_args('compiler', @_),
+			LD => build_args('linker', @_);
+}
+
+=head2 MB
+
+If you want to use CUDA in your XS files and you use C<Module::Build> to manage your
+distribution, ExtUtils::nvcc provides a simple function that will help set up your
+build configuration. As with the others, it returns a useful key => value collection,
+this time applicable to the config anonymous hash that goes into Module::Build's
+constructor. Here's how you should use it:
+
+ use ExtUtils::nvcc;
+ my $build = Module::Build->new(
+     # ... other options ...
+     config => {ExtUtils::nvcc::MB},
+ );
+
+If you run into compile trouble and you suspect it has to do with how ExtUtils::nvcc
+is processing your compiler's command-line arguments, you can request a verbose
+output by calling C<MB> with the argument C<verbose>, as discussed under
+L</Optional Arguments>:
+
+ use ExtUtils::nvcc;
+ my $build = Module::Build->new(
+     # ... other options ...
+     config => {ExtUtils::nvcc::MB('verbose')},
+ );
+
+=cut
+
+################################################################################
+# Usage			: MB([args])
+# Purpose		: Returns the key => value pairs appropriate for Module::Build
+#				: to use ExtUtils::nvcc::Backend as a compiler and linker
+#				: wrapper.
+# Returns		: Compiler and linker key => value pairs
+# Parameters	: arguments (simple options) that control how
+#				: ExtUtils::nvcc::Backend runs
+# Throws		: nothing
+# Comments		: none
+# See also		: Inline, EUMM, build_args
+
+sub MB {
+	return	cc => build_args('compiler', @_),
+			ld => build_args('linker', @_);
+
+}
+
+=head2 Optional Arguments
+
+I would hope that if there's a problem during compilation, it's due to a mistake
+in your code and not this module. However, this toolchain is still quite new and
+rather untested, so errors may sometimes arise due to L<ExtUtils::nvcc::Backend>
+mis-handling an argument. Verbosity, and possibly other arguments in the future,
+can be sent to L<ExtUtils::nvcc::Backend> to help you sort it all out. All you
+need to do is supply the word 'verbose' as an argument to L</Inline>, L</EUMM>,
+or L</MB>.
+
+=begin more-arguments
+
+Here is the full list of arguments and their affects:
+ 
+ Option     Description
+ ----------------------------------------------
+ verbose    make ExtUtils::nvcc::Backend chatty
+
+=end more-arguments
+
+=cut
+
+our %arg_for = qw(
+	verbose			ExtUtils::nvcc::Backend::verbose
+);
+
+=head2 build_args
+
+This is not really a user-level function, but I feel obligated to document it.
+It is used by the user-level toolchain configuration functions C<Inline>,
+C<EUMM>, and C<MB> to convert the mode (compiler or linker) along with the
+options into the command-line needed to
+invoke ExtUtils::nvcc::Backend as a compiler or linker. If you're not working on
+ExtUtils::nvcc itself, don't worry about this function.
+
+=cut
+
+################################################################################
+# Usage			: build_args($mode, [@args])
+# Purpose		: Constructs the command-line invocation of
+#				: ExtUtils::nvcc::Backend given the mode and
+#				: user-level arguments
+# Returns		: A string with the command-line invocants
+# Parameters	: $mode, either 'compiler' or 'linker'
+#				: @args, user-level arguments to MB, EUMM, and Inline
+# Throws		: if a bade mode or an invalid option is provided
+# Comments		: For example, an output of this function with no args could be
+#				:    perl -MExtUtils::nvcc::Backend -e"ExtUtils::nvcc::Backend::linker" --
+# See also		: verbosity, Inline, EUMM, MB, %args_for
+
+sub build_args {
+	my $mode = shift;
+	croak("Bad mode; must be either 'compiler' or 'linker'")
+		unless $mode eq 'compiler' or $mode eq 'linker';
 	
-	# Start building the new object, starting with the original args.
-	my $self = {original => [@_]};
-	
-	bless $self, $class;
+	# Go through and build the argument list, checking the arguments along the
+	# way. If there are bad arguments, collect a full list and croak them all.
+
+	my $args = qq{$^X -MExtUtils::nvcc::Backend -e"};
+	my @bad_args;
+	foreach (@_) {
+		if (exists $arg_for{$_}) {
+			$args .= $arg_for{$_} . ';';
+		}
+		else {
+			push @bad_args, $_;
+		}
+	}
+	croak('Bad arguments: ' . join(', ', @bad_args)) if @bad_args;
+	return $args . qq{ExtUtils::nvcc::Backend::$mode" --};
 }
-
-=head2 execute
-
-Executes nvcc using the L<system> command and the set of modified arguments.
-
-=cut
-
-sub execute {
-	my $self = shift;
-	system('nvcc', $self->{revised_args});
-}
-
-=head2 verbose
-
-Gets/sets the verbosity of the argument processing functions.
-
-=cut
-
-sub verbose {
-	my $self = shift;
-	my $new_value = shift;
-	$self->{verbose} = $new_value if (defined $new_value);
-	return $self->{verbose};
-}
-
-=head2 compiler_or_linker
-
-This takes a single argument--the list of command-line arguments--and determines
-whether they makes sense as a call to a compiler or to a linker. The function
-returns a string that is either 'compiler' or 'linker'. It does not modify the
-array.
-
-=cut
-
-sub compiler_or_linker (\@) {
-	my $args = shift;
-	
-}
-
-=head2 rename_source_file
-
-nvcc has special file handling that depends on the file extension. Specifically,
-files ending in the .cu extension have many more steps performed during the
-compilation phase than files ending with a .c extension. Unfortunately,
-L<Inline::C> does not provide for fine-grained control over the file extension
-of the temporary file without overloading (and why should it?), so in order for
-nvcc to work as a drop-in replacement for gcc or g++, this function will look
-for source files ending in .c and rename them so they end in .cu.
-
-This function is really only necessary if one plans on directly invoking
-Inline::C with perl_nvcc. A better general solution is to create the module
-Inline::CUDA which handles the file-naming conventions, but until that arrives,
-this function will be important.
-
-This function only takes a single argument, the array of arguments, modifies the
-source filename in the argument list, and renames the file.
-
-=cut
-
-sub rename_source_file {
-	my $args = shift;
-	
-	# go through each argument, looking for the 
-}
-
-=end later
-
-=cut
 
 1;
 
+=head1 DIAGNOSTICS
+
+ExtUtils::nvcc could croak for a number of reasons. To keep things concise, I
+list both the front-end and the back-end diagnostic messages here. I begin with
+the front-end errors, errors that ExtUtils::nvcc will throw at you:
+
+=over
+
+=item Bad mode; must be either 'compiler' or 'linker'
+
+This is an internal error that gets thrown when C<build_args> is called with
+an invalid mode. If you see this, either you are C<build_args> yourself, and
+not supplying the string 'compiler' or 'linker', or there is an internal error.
+In the latter case, please report the error to the bug-tracker listed below.
+
+=item Bad arguments: <bad-arg-1>, <bad-arg-2>, ...
+
+This message means that you supplied an invalid argument to one of the
+user-level functions C<Inline>, C<EUMM>, or C<MB>. Check your spelling and
+capitalization against L</Optional Arguments> discussed above.
+
+=back
+
+These are the back-end errors, errors that L<ExtUtils::nvcc::Backend> will have:
+
+=over
+
+=item Last argument [[<arg>]] left me expecting a value, but I didn't find one
+
+Apparently you (or the build system) supplied a list of arguments to
+L<ExtUtils::nvcc::Backend> ending with an option that expects an argument.
+For example, the C<-o> option is a very common option that indicates the output
+filename from the compilation or linking process. If you supply a C<-o> option
+to L<ExtUtils::nvcc::Backend>, it expects the following argument to be the
+output filename. If this is your last argument and you don't supply a filename,
+this error will be thrown.
+
+If the last argument is complete, to the best of your knowledge, it could be
+that L<ExtUtils::nvcc::Backend> mis-parsed your command-line arguments in other
+ways. You should enable verbose output and study that for more details.
+
+=item Nothing to do! You didn't give me any arguments, not even a file!
+
+This means that you somehow invoked L<ExtUtils::nvcc::Backend> without a single
+argument. Double-check your command-line invocation and try again.
+
+=item You must provide at least one source file
+
+Somehow you invoked L<ExtUtils::nvcc::Backend> without a source file listed.
+Double-check your command-line invocation and try again.
+
+=item Unable to run nvcc. Is it in your path?
+
+This error means that nvcc cannot be found (or more precisely, that nvcc -V
+does not give a meaningful result). As the error suggests, be sure to check
+that nVidia's nvcc is in your path. You will also get this error if you do not
+have nvcc installed. In that case, install nVidia's CUDA toolkit and you should
+be ready to go.
+
+=item nvcc encountered a problem
+
+In this case, nvcc attempted to compile or link your code and failed. Look over
+the compiler/linker output for clues as to where your code went wrong. My guess
+is that there is a compiler error in your code.
+
+However, it is possible that the Backend is out-of-touch with your version of
+nvcc, and it (for example) passed an nvcc argument through to your compiler.
+Your compiler won't like that and it will likely complain. In that case, file
+a bug report, as discussed in L</BUGS AND LIMITATIONS>.
+
+=back
+
+=head1 DEPENDENCIES
+
+This toolchain requires that you have the following pieces:
+
+=over
+
+=item nVidia's CUDA toolkit
+
+You must have nVidia's CUDA toolkit in order to compile CUDA code. This module
+ultimately calls nvcc to perform the compilation; it cannot compile your CUDA
+code itself. Furthermore, nvcc requires a C++ compiler, so you'll need to be
+sure you have one of those.
+
+=item A Perl development environment
+
+You will need to have access to the Perl development toolchain, either
+L<ExtUtils::MakeMaker> or L<Module::Build>. (Note L<Inline> uses EU::MM on the
+backend.) If you are in an environment in which you do not have these tools,
+you will be able to use L<ExtUtils::nvcc::Backend>, but you'll have a hard time
+tying anything into Perl.
+
+=back
+
+=head1 BUGS AND LIMITATIONS
+
+The giant, huge, fat, glaring bug with ExtUtils::nvcc is that it creates code
+which segfaults at the very end of the program. There is deep magic, almost
+certainly involving a double-free, which I have yet to figure out. Any help for
+this would be much appreciated.
+
+The second major problem is that the Backend has a very ad-hoc parsing scheme
+that is not tested at the moment. It would be better, I think, to query nvcc at
+runtime for arguments that it accepts so that there could never be a version
+skew for the arguments that the Backend parses and the arguments that nvcc
+accepts.
+
+I believe C<ExtUtils::nvcc> will operate on Windows machines under Cygwin and
+under Strawberry Perl, since they use gcc. Furthermore, I believe that 
+C<ExtUtils::nvcc> does in fact work with Microsoft's compiler as well, but I do
+not have a Windows machine or the Microsoft toolchain so I cannot develop or
+test for that system. If you are a developer with an interest in ensuring that
+L<ExtUtils::nvcc::Backend> works with Microsoft's compiler, I welcome your
+contributions!
+
+The code for ExtUtils::nvcc is hosted at github, but please file bugs at
+L<https://rt.cpan.org/Public/Bug/Report.html?Queue=ExtUtils-nvcc>.
+
 =head1 AUTHOR
 
-David Mertens <dcmertens.perl@gmail.com>
+I have obfuscated my email address. Simply remove the portion that would not
+be sensible for a Perl developer.
+
+David Mertens <dcmertens.perl.csharp@gmail.com>
 
 =head1 SEE ALSO
 
-L<Inline::C>, L<KappaCUDA>, L<http://www.nvidia.com/object/cuda_home_new.html>
+The source code for this project is on github at L<github.com/run4flat/perl_nvcc>.
+
+This is intended to be part of the toolchain to enable L<CUDA>. A Perl module
+for CUDA does not yet exist, but (hopefully) this will be used for it when that
+happens.
+
+You can read more about CUDA at nVidia's website:
+L<http://www.nvidia.com/object/cuda_home_new.html>
+
+An alternative to embedding CUDA in C or XS is L<KappaCUDA>.
+
+Other imporant and related toolchain modules include L<Inline::C>,
+L<Module::Build>, L<ExtUtils::MakeMaker>
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (c) 2010-2011 David Mertens. All rights reserved.
+
+This module is free software; you can redistribute it and/or modify it under
+the same terms as Perl itself. See L<perlartistic>.
+
+This software is distributed in the hope that it will be useful,
+but without any warranty; without even the implied warranty of
+merchantability or fitness for a particular purpose.
+
+=cut
