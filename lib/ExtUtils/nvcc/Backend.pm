@@ -12,6 +12,9 @@ package ExtUtils::nvcc::Backend;
 # For errors, of course:
 use Carp qw(croak);
 
+# To check if this is a windows perl built with gcc:
+use Config;
+
 =head1 SYNOPSIS
 
 This is meant to be used from the command-line, invoking either the C<compiler>
@@ -193,6 +196,30 @@ To use, try something like this:
 # See also		: compiler, linker
 
 sub run_nvcc {
+	# XXX nvcc does not play nicely with gcc on Windows. It requires cl (from
+	# Visual Studio). There might be a heroic way to get around this, but the
+	# obvious/historic answer (using --foreign) does not work:
+	if ($Config{cc} eq 'gcc' and $Config{osname} =~ /MSWin/) {
+#		push @_, '--foreign=gcc' unless grep {/^--foreign/} @_;
+		warn join("\n", '', '*'x61
+			, '* This will very likely not compile. You compiled your perl *'
+			, '* using gcc (either with mingw, Cygwin, or Strawberry) but  *'
+			, '* nvcc on Windows requires Visual Studio, i.e. cl.exe. If   *'
+			, '* you have Visual Studio, this may compile, but it is       *'
+			, '* unlikely to link correctly.  I will attempt, with fingers *'
+			, '* crossed...                                                *'
+			, '*'x61, '');
+			
+	}
+	# See these forum discussions:
+	# http://forums.nvidia.com/index.php?showtopic=78531
+	# http://forums.nvidia.com/index.php?showtopic=182655
+	
+	# The heroic ways to get around this would be to write a wrapper around gcc
+	# that accepts cl arguments, or to create a blank cl.bat and manually
+	# seperate the kernel code from the host code and send only the kernel code
+	# through nvcc.
+
 	our $verbose;
 	print "Running nvcc with args [[", join(']], [[', @_), "]]\n" if $verbose;
 
@@ -259,6 +286,12 @@ sub process_args {
 			push @nvcc_args, $_;
 			$include_next_arg = 0;
 		}
+		#*#*# Ridiculous edge case for Fedora 14:
+		elsif ($_ eq '-Wp,-D_FORTIFY_SOURCE=2') {
+			push @nvcc_args, '-D_FORTIFY_SOURCE=2';
+			# XXX - still not working for Fedora becuase the linker doesn't like
+			# the atom tuning invoked in the stock perl build.
+		}
 		elsif (
 			# check if it's an nvcc-safe flag or option, and pass it along if so:
 			
@@ -278,7 +311,15 @@ sub process_args {
 			# These are valid command-line options with associated values, but which
 			# don't have an = seperating the option from the value
 			or
-			m/^-[lLDUIoOmG]./
+			m/^-[lLDUIoO]./
+			or
+			# Handle the machine regex more precisely since gcc has the -march
+			# option, which can throw this off:
+			m{^-m(?:32|64)$}
+			or
+			# Handle G flag more precisely since cl.exe likes to use -G followed
+			# by letters:
+			m/^-G\d/
 			or
 			# These are valid command-line options that have an = seperating the
 			# option from the value.
@@ -347,6 +388,19 @@ sub process_args {
 	croak ("Last argument [[" . $_[-1] . "]] left me expecting a value, but I didn't find one")
 		if $include_next_arg;
 	
+	# I'm finding weird instances of mutliple -O settings. As such, I'm going
+	# to insert an explicit check for it. I'm sure this could be more efficient
+	my $O_found = 0;
+	OPTION: for(my $i = 0; $i < $#nvcc_args; $i++) {
+		next OPTION unless $nvcc_args[$i] =~ /^-O/;
+		# If we already found the -O option, then splice this one out
+		if ($O_found) {
+			splice @nvcc_args, $i, 1;
+			redo OPTION;
+		}
+		$O_found++;
+	}
+
 	if (our $verbose) {
 		print "ExtUtils::nvcc found nvcc args [[", join(']], [[', @nvcc_args), "]]\n";
 		print "ExtUtils::nvcc found other args [[", join(']], [[', @other_args), "]]\n";
